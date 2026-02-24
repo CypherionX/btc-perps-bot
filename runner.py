@@ -1,4 +1,8 @@
 import time
+import json
+from pathlib import Path
+from datetime import datetime, timezone
+
 import ccxt
 from dotenv import load_dotenv
 
@@ -9,9 +13,22 @@ from bot.data.candles import ohlcv_to_df
 from bot.strategy.sma_cross import SMACross
 from bot.risk.risk_manager import RiskManager
 from bot.execution.executor import Executor
-from bot.filters.htf_structure import compute_htf_bias
 
 from bot.derivatives.binance_metrics import BinanceDerivativesMetrics
+from bot.filters.htf_structure import compute_htf_bias
+
+
+STATUS_PATH = Path("status.json")
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _atomic_write_json(path: Path, payload: dict):
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=False), encoding="utf-8")
+    tmp.replace(path)
 
 
 def _create_metrics_if_enabled(cfg: BotConfig, log):
@@ -25,57 +42,146 @@ def _create_metrics_if_enabled(cfg: BotConfig, log):
         log.info("Derivatives filters enabled - BinanceDerivativesMetrics initialized")
         return m
     except Exception as e:
-        # Safer option is to return None and just log it (so the bot still runs).
-        log.warning(f"Failed to initialize BinanceDerivativesMetrics ({e}) - proceeding WITHOUT filters")
+        log.warning(f"Failed to initialize BinanceDerivativesMetrics ({e}) - proceeding WITHOUT derivatives filters")
         return None
 
 
 def _apply_derivatives_filters(cfg: BotConfig, log, metrics, sig):
     """
-    Mutates/returns a Signal: blocks trades by converting buy/sell -> flat when filters fail.
+    Returns (sig, deriv_state)
+      - sig may be mutated to flat when filters fail
+      - deriv_state is written to status.json for dashboard use
     """
+    deriv_state = {
+        "enabled": metrics is not None,
+        "funding": None,
+        "funding_max_abs": float(cfg.get("filters", "funding_max_abs", default=0.0003)),
+        "oi_slope": None,
+        "oi_tf": cfg.get("filters", "oi_trend_timeframe", default="5m"),
+        "oi_points": int(cfg.get("filters", "oi_trend_points", default=6)),
+        "require_oi_rising": bool(cfg.get("filters", "require_oi_rising", default=True)),
+        "blocked": False,
+        "block_reason": None,
+        "error": None,
+    }
+
     if metrics is None:
-        return sig
+        return sig, deriv_state
 
     if sig.action not in ("buy", "sell"):
-        return sig
+        return sig, deriv_state
 
     try:
-        funding = metrics.funding_rate_now("BTC/USDT")
-        funding_max_abs = float(cfg.get("filters", "funding_max_abs", default=0.0003))
+        funding = float(metrics.funding_rate_now("BTC/USDT"))
+        deriv_state["funding"] = funding
+        funding_max_abs = deriv_state["funding_max_abs"]
 
         # Funding gating
         if sig.action == "buy" and funding > funding_max_abs:
-            log.info(f"FILTER BLOCK: funding too high for LONG (funding={funding:.6f} > {funding_max_abs:.6f})")
+            deriv_state["blocked"] = True
+            deriv_state["block_reason"] = f"funding_too_high_for_long ({funding:.6f} > {funding_max_abs:.6f})"
             sig.action = "flat"
-            return sig
+            return sig, deriv_state
 
         if sig.action == "sell" and funding < -funding_max_abs:
-            log.info(f"FILTER BLOCK: funding too low for SHORT (funding={funding:.6f} < {-funding_max_abs:.6f})")
+            deriv_state["blocked"] = True
+            deriv_state["block_reason"] = f"funding_too_low_for_short ({funding:.6f} < {-funding_max_abs:.6f})"
             sig.action = "flat"
-            return sig
+            return sig, deriv_state
 
         # OI trend gating (optional)
-        require_oi = bool(cfg.get("filters", "require_oi_rising", default=True))
-        if require_oi:
-            pts = int(cfg.get("filters", "oi_trend_points", default=6))
-            tf = cfg.get("filters", "oi_trend_timeframe", default="5m")
-            slope = metrics.open_interest_trend("BTC/USDT", timeframe=tf, points=pts)
+        if deriv_state["require_oi_rising"]:
+            pts = deriv_state["oi_points"]
+            tf = deriv_state["oi_tf"]
+            slope = float(metrics.open_interest_trend("BTC/USDT", timeframe=tf, points=pts))
+            deriv_state["oi_slope"] = slope
 
             if slope <= 0:
-                log.info(f"FILTER BLOCK: OI not rising (slope={slope:.2f})")
+                deriv_state["blocked"] = True
+                deriv_state["block_reason"] = f"oi_not_rising (slope={slope:.2f})"
                 sig.action = "flat"
-                return sig
+                return sig, deriv_state
 
-        log.info(f"DERIV METRICS OK: funding={funding:.6f}")
-
-        return sig
+        return sig, deriv_state
 
     except Exception as e:
-        # Fail-safe: if metrics fail, block trading (safer)
-        log.info(f"FILTER BLOCK: derivatives metrics unavailable ({e})")
+        # Fail-safe: if derivatives metrics fail, block trading (safer)
+        deriv_state["blocked"] = True
+        deriv_state["block_reason"] = "derivatives_metrics_unavailable"
+        deriv_state["error"] = str(e)
         sig.action = "flat"
-        return sig
+        return sig, deriv_state
+
+
+def _apply_htf_gate(cfg: BotConfig, log, pub, symbol: str, sig):
+    """
+    Fetches HTF candles, computes bias, and gates the signal.
+    Returns (sig, htf_state)
+    """
+    htf_state = {
+        "enabled": bool(cfg.get("htf", "enabled", default=True)),
+        "timeframe": cfg.get("htf", "timeframe", default="4h"),
+        "ema_period": int(cfg.get("htf", "ema_period", default=200)),
+        "neutral_band_atr": float(cfg.get("htf", "neutral_band_atr", default=0.25)),
+        "neutral_behavior": cfg.get("htf", "neutral_behavior", default="block"),
+        "bias": None,
+        "close": None,
+        "ema": None,
+        "atr": None,
+        "reason": None,
+        "blocked": False,
+        "block_reason": None,
+        "error": None,
+    }
+
+    if not htf_state["enabled"]:
+        return sig, htf_state
+
+    try:
+        limit = max(htf_state["ema_period"] + 50, 300)
+        ohlcv_htf = pub.fetch_ohlcv(symbol, timeframe=htf_state["timeframe"], limit=limit)
+        df_htf = ohlcv_to_df(ohlcv_htf)
+
+        bias = compute_htf_bias(
+            df_htf,
+            ema_period=htf_state["ema_period"],
+            neutral_band_atr=htf_state["neutral_band_atr"],
+        )
+
+        htf_state["bias"] = bias.bias
+        htf_state["close"] = bias.close
+        htf_state["ema"] = bias.ema
+        htf_state["atr"] = bias.atr
+        htf_state["reason"] = bias.reason
+
+        # Gate only if we have a trade signal
+        if sig.action in ("buy", "sell"):
+            if bias.bias == "bull" and sig.action == "sell":
+                htf_state["blocked"] = True
+                htf_state["block_reason"] = "htf_bull_blocks_short"
+                sig.action = "flat"
+                return sig, htf_state
+
+            if bias.bias == "bear" and sig.action == "buy":
+                htf_state["blocked"] = True
+                htf_state["block_reason"] = "htf_bear_blocks_long"
+                sig.action = "flat"
+                return sig, htf_state
+
+            if bias.bias == "neutral" and htf_state["neutral_behavior"] == "block":
+                htf_state["blocked"] = True
+                htf_state["block_reason"] = "htf_neutral_blocks_trade"
+                sig.action = "flat"
+                return sig, htf_state
+
+        return sig, htf_state
+
+    except Exception as e:
+        htf_state["blocked"] = True
+        htf_state["block_reason"] = "htf_unavailable"
+        htf_state["error"] = str(e)
+        sig.action = "flat"
+        return sig, htf_state
 
 
 def main():
@@ -83,19 +189,19 @@ def main():
     cfg = BotConfig.load("config.yaml")
     log = get_logger()
 
-    # Initialize derivatives metrics based on configuration
-    metrics = _create_metrics_if_enabled(cfg, log)
-
     symbol = cfg.get("symbol", default="BTC/USDT")
     timeframe = cfg.get("timeframe", default="1h")
     poll = int(cfg.get("poll_seconds", default=60))
 
-    # Public market data (no keys needed) - spot candles
+    # Public market data (spot candles)
     pub = ccxt.binance({
         "enableRateLimit": True,
         "timeout": 30000,
         "options": {"defaultType": "spot"},
     })
+
+    # Derivatives metrics client (funding + OI)
+    metrics = _create_metrics_if_enabled(cfg, log)
 
     # Paper trading account
     start_equity = float(cfg.get("risk", "account_equity_usd", default=500))
@@ -114,8 +220,8 @@ def main():
     risk = RiskManager(cfg)
     exe = Executor(client, cfg, log)
 
-    # simple in-process position tracking (paper mode)
-    pos_side = None      # "long" | "short" | None
+    # local position tracking
+    pos_side = None
     pos_qty = 0.0
     stop_px = None
     take_px = None
@@ -123,54 +229,71 @@ def main():
     log.info("BOT STARTED (PAPER MODE)")
 
     while True:
+        loop_started = _utc_now_iso()
+
+        status = {
+            "ts_utc": loop_started,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "price": None,
+            "equity": None,
+            "position": {
+                "side": pos_side,
+                "qty": pos_qty,
+                "stop": stop_px,
+                "take": take_px,
+            },
+            "signal": {
+                "action": None,
+                "reason": None,
+                "stop_price": None,
+                "take_price": None,
+            },
+            "risk": {
+                "can_trade": None,
+                "reason": None,
+            },
+            "filters": {
+                "derivatives": None,
+                "htf": None,
+            },
+            "errors": [],
+        }
+
         try:
             ohlcv = pub.fetch_ohlcv(symbol, timeframe=timeframe, limit=250)
             df = ohlcv_to_df(ohlcv)
-            # ---- HTF structure ----
-            htf_enabled = bool(cfg.get("htf", "enabled", default=True))
-            htf_bias = None
-
-            if htf_enabled:
-                htf_tf = cfg.get("htf", "timeframe", default="4h")
-                ema_period = int(cfg.get("htf", "ema_period", default=200))
-                neutral_band = float(cfg.get("htf", "neutral_band_atr", default=0.25))
-                neutral_behavior = cfg.get("htf", "neutral_behavior", default="block")
-
-                ohlcv_htf = pub.fetch_ohlcv(symbol, timeframe=htf_tf, limit=max(ema_period + 50, 300))
-                df_htf = ohlcv_to_df(ohlcv_htf)
-
-            htf_bias = compute_htf_bias(df_htf, ema_period=ema_period, neutral_band_atr=neutral_band)
             last_px = float(df.iloc[-1]["close"])
 
             equity_now = float(client.fetch_balance()["USD"]["free"])
-            can_trade, reason = risk.can_trade(equity_now)
+            can_trade, can_reason = risk.can_trade(equity_now)
 
             sig = strat.generate(df)
-            sig = _apply_derivatives_filters(cfg, log, metrics, sig)
 
-            # ---- gate by HTF bias ----
-            if htf_enabled and sig.action in ("buy", "sell") and htf_bias is not None:
-                if htf_bias.bias == "bull" and sig.action == "sell":
-                    log.info(f"HTF BLOCK: HTF=bull blocks SHORT ({htf_bias.reason}) close={htf_bias.close:.2f} ema={htf_bias.ema:.2f}")
-                    sig.action = "flat"
+            # Apply derivatives filters first (funding + OI)
+            sig, deriv_state = _apply_derivatives_filters(cfg, log, metrics, sig)
 
-            elif htf_bias.bias == "bear" and sig.action == "buy":
-                log.info(f"HTF BLOCK: HTF=bear blocks LONG ({htf_bias.reason}) close={htf_bias.close:.2f} ema={htf_bias.ema:.2f}")
-                sig.action = "flat"
+            # Apply HTF gate
+            sig, htf_state = _apply_htf_gate(cfg, log, pub, symbol, sig)
 
-            elif htf_bias.bias == "neutral":
-                neutral_behavior = cfg.get("htf", "neutral_behavior", default="block")
-            if neutral_behavior == "block":
-                log.info(f"HTF BLOCK: HTF=neutral blocks trade ({htf_bias.reason}) close={htf_bias.close:.2f} ema={htf_bias.ema:.2f}")
-            sig.action = "flat"
-
-            if htf_enabled and htf_bias is not None:
-                log.info(f"HTF: {cfg.get('htf','timeframe',default='4h')} bias={htf_bias.bias} close={htf_bias.close:.2f} ema={htf_bias.ema:.2f}")
+            # Update status payload
+            status["price"] = last_px
+            status["equity"] = equity_now
+            status["risk"]["can_trade"] = can_trade
+            status["risk"]["reason"] = can_reason
+            status["signal"] = {
+                "action": sig.action,
+                "reason": sig.reason,
+                "stop_price": sig.stop_price,
+                "take_price": sig.take_price,
+            }
+            status["filters"]["derivatives"] = deriv_state
+            status["filters"]["htf"] = htf_state
 
             log.info(
                 f"px={last_px:.2f} equity={equity_now:.2f} "
                 f"pos={pos_side}:{pos_qty:.6f} signal={sig.action} ({sig.reason}) "
-                f"trade_ok={can_trade}({reason})"
+                f"trade_ok={can_trade}({can_reason})"
             )
 
             # ---- exits ----
@@ -192,6 +315,8 @@ def main():
                     stop_px, take_px = None, None
                     risk.set_cooldown()
 
+                    status["position"] = {"side": None, "qty": 0.0, "stop": None, "take": None}
+
             # ---- entries ----
             if (not pos_side) and can_trade and sig.action in ("buy", "sell") and sig.stop_price and sig.take_price:
                 entry = last_px
@@ -207,11 +332,19 @@ def main():
                     stop_px = float(sig.stop_price)
                     take_px = float(sig.take_price)
 
-            time.sleep(poll)
+                    status["position"] = {"side": pos_side, "qty": pos_qty, "stop": stop_px, "take": take_px}
 
         except Exception as e:
             log.error(f"loop_error: {e}")
-            time.sleep(5)
+            status["errors"].append(str(e))
+
+        # Always write status.json even if there was an error
+        try:
+            _atomic_write_json(STATUS_PATH, status)
+        except Exception as e:
+            log.error(f"status_write_error: {e}")
+
+        time.sleep(poll)
 
 
 if __name__ == "__main__":

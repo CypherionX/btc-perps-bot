@@ -1,0 +1,53 @@
+{
+  "ts_utc": "2026-02-24T04:15:11.625152+00:00",
+  "symbol": "BTC/USDT",
+  "timeframe": "1h",
+  "price": 63024.48,
+  "equity": 500.0,
+  "position": {
+    "side": null,
+    "qty": 0.0,
+    "stop": null,
+    "take": null
+  },
+  "signal": {
+    "action": "flat",
+    "reason": "no_cross",
+    "stop_price": null,
+    "take_price": null
+  },
+  "risk": {
+    "can_trade": true,
+    "reason": "ok"
+  },
+  "filters": {
+    "derivatives": {
+      "enabled": true,
+      "funding": null,
+      "funding_max_abs": 0.0003,
+      "oi_slope": null,
+      "oi_tf": "5m",
+      "oi_points": 6,
+      "require_oi_rising": true,
+      "blocked": false,
+      "block_reason": null,
+      "error": null
+    },
+    "htf": {
+      "enabled": true,
+      "timeframe": "4h",
+      "ema_period": 200,
+      "neutral_band_atr": 0.25,
+      "neutral_behavior": "block",
+      "bias": "bear",
+      "close": 63024.48,
+      "ema": 73948.16207587151,
+      "atr": 1055.4049999999993,
+      "reason": "close_below_ema",
+      "blocked": false,
+      "block_reason": null,
+      "error": null
+    }
+  },
+  "errors": []
+}
