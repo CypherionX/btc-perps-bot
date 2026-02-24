@@ -1,0 +1,23 @@
+mode: paper
+symbol: BTC/USDT
+timeframe: 1h
+poll_seconds: 60
+
+strategy:
+  name: sma_cross
+  fast: 20
+  slow: 50
+
+risk:
+  account_equity_usd: 500
+  risk_per_trade_pct: 0.005
+  max_daily_loss_pct: 0.02
+  max_position_pct: 0.25
+  cooldown_seconds: 600
+  stop_atr_mult: 2.0
+  takeprofit_rr: 2.0
+
+execution:
+  order_type: market
+  slippage_bps: 5
+  reduce_only: true

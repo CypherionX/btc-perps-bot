@@ -1,0 +1,7 @@
+ccxt
+pandas
+pyyaml
+python-dotenv
+tenacity
+streamlit
+plotly
